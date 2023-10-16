@@ -45,6 +45,9 @@ def read_calib(calib_path):
     """
     with open(calib_path, 'r') as f:
         raw = f.readlines()
+    # Pi 对应autoware标定文件的k，这里的k是畸变校正后的K，同理用的图像也是畸变校正后的图像
+    # R0 不需要
+    # Tr 外参矩阵，同样对应autoware外参
     P0 = np.array(list(map(float, raw[0].split()[1:]))).reshape((3, 4))
     P1 = np.array(list(map(float, raw[1].split()[1:]))).reshape((3, 4))
     P2 = np.array(list(map(float, raw[2].split()[1:]))).reshape((3, 4))
@@ -58,7 +61,7 @@ def read_calib(calib_path):
     imu2lidar_m = np.vstack((imu2lidar_m, np.array([0, 0, 0, 1])))
     return P0, P1, P2, P3, R0, lidar2camera_m, imu2lidar_m
 
-
+# pyqtgraph可视化渲染点云，这里不用看，专用ros+rviz
 def vis_pointcloud(points, colors=None):
     """
     渲染显示雷达点云
@@ -73,6 +76,7 @@ def vis_pointcloud(points, colors=None):
     else:
         colors = (1, 1, 1, 1)
     og_widget = gl.GLViewWidget()
+    # 每个点的大小设为0.1
     point_size = np.zeros(points.shape[0], dtype=np.float16) + 0.1
 
     points_item1 = gl.GLScatterPlotItem(pos=points, size=point_size, color=colors, pxMode=False)
@@ -120,29 +124,48 @@ def lidar2camera(point_in_lidar, extrinsic):
     :param extrinsic: numpy.ndarray `4 x 4`
     :return: point_in_camera numpy.ndarray `N x 3`
     """
+    # 点云加了1维度，变成N*4，再转置，变为4*N，可以与外参矩阵相乘
     point_in_lidar = np.hstack((point_in_lidar, np.ones(shape=(point_in_lidar.shape[0], 1)))).T
+    # 乘法，(4,4)*(4,N)→(4,N),再丢掉最后一列，变为(3,N)
     point_in_camera = np.matmul(extrinsic, point_in_lidar)[:-1, :]  # (X, Y, Z)
+    # 转置，(3,N)→(N,3)
     point_in_camera = point_in_camera.T
     return point_in_camera
 
 
 def camera2image(point_in_camera, intrinsic):
     """
-    相机系到图像系投影
-    :param point_in_camera: point_in_camera numpy.ndarray `N x 3`
+    相机系到图像系投影变换
+    :param point_in_camera: point_in_camera numpy.ndarray `N x 3`   (x,y,z)
     :param intrinsic: numpy.ndarray `3 x 3` or `3 x 4`
     :return: point_in_image numpy.ndarray `N x 3` (u, v, z)
     """
+    # N*3转置为3*N，方便后面矩阵乘法
     point_in_camera = point_in_camera.T
-    point_z = point_in_camera[-1]
+    # 后续相机系→图像系的投影中，会损失z轴(前向距离)信息，因此提前预留
+    point_z = point_in_camera[-1] # 提取最后一列，即(x,y,z)的z
 
-    if intrinsic.shape == (3, 3):  # 兼容kitti的P2, 对于没有平移的intrinsic添0
+    # 同时兼容自己标定的3*3矩阵，和kitti标定文件的3*4矩阵
+    if intrinsic.shape == (3, 3):  
+        # 兼容kitti的P2, 对于没有平移的intrinsic添一列0: (3,3)+(3,1)-->(3,4)
         intrinsic = np.hstack((intrinsic, np.zeros((3, 1))))
-
+    
+    # 为了兼容, 点云矩阵添一列1: (3,N)+(1,N)-->(4,N)
+    # 后面用自己的数据，为了简化提速，均可以去掉，全按照3走
     point_in_camera = np.vstack((point_in_camera, np.ones((1, point_in_camera.shape[1]))))
-    point_in_image = (np.matmul(intrinsic, point_in_camera) / point_z)  # 向图像上投影
-    point_in_image[-1] = point_z
+
+    # 相机系-->图像系投影，其中point_in_camera是雷达系-->相机系的投影结果
+    # (3,4)*(4,N)-->(3,N)
+    point_in_image = (np.matmul(intrinsic, point_in_camera) / point_z)  
+    # print(point_in_image, point_in_image.shape)  # (3,N)
+
+    # 图像系最后一列赋值，(3,N)中的3指(u,v,z),横轴为u，纵轴为v
+    point_in_image[-1] = point_z 
+
+    # (3,N)转置为(N,3)
+    # 意义：每一个激光雷达点到像素点间的对应关系
     point_in_image = point_in_image.T
+
     return point_in_image
 
 
@@ -154,6 +177,7 @@ def lidar2image(point_in_lidar, extrinsic, intrinsic):
     :param intrinsic: numpy.ndarray `3 x 3` or `3 x 4`
     :return: point_in_image numpy.ndarray `N x 3` (u, v, z)
     """
+    # 坐标系连续转换：激光雷达→相机→图像
     point_in_camera = lidar2camera(point_in_lidar, extrinsic)
     point_in_image = camera2image(point_in_camera, intrinsic)
     return point_in_image
@@ -170,14 +194,25 @@ def get_fov_mask(point_in_lidar, extrinsic, intrinsic, h, w):
     :return: point_in_image: (u, v, z)  numpy.ndarray `N x 3`
     :return:                 numpy.ndarray  `1 x N`
     """
+    # 雷达系-->相机系-->图像系的转换
     point_in_image = lidar2image(point_in_lidar, extrinsic, intrinsic)
+
+    # 提取出最后一列(z)，保留z>0的所有点云
     front_bound = point_in_image[:, -1] > 0
+
+    # u v 列的值四舍五入取整，因为像素坐标不可能有小数
     point_in_image[:, 0] = np.round(point_in_image[:, 0])
     point_in_image[:, 1] = np.round(point_in_image[:, 1])
+    
+    # 指保留u v值能落在图像上的，即0<u<w(idth) 0<v<h(eight)
     u_bound = np.logical_and(point_in_image[:, 0] >= 0, point_in_image[:, 0] < w)
     v_bound = np.logical_and(point_in_image[:, 1] >= 0, point_in_image[:, 1] < h)
+
+    # 生成最终视场掩膜
     uv_bound = np.logical_and(u_bound, v_bound)
     mask = np.logical_and(front_bound, uv_bound)
+
+    # 输出掩膜筛选后的点，以及视场掩膜
     return point_in_image[mask], mask
 
 
@@ -248,14 +283,21 @@ def render_image_with_depth(color_image, depth_image, max_depth=None):
 
 
 if __name__ == '__main__':
+    # 设置点云、图像路径
     image_path = '../data_example/3d_detection/image_2/000007.png'
     bin_path = '../data_example/3d_detection/velodyne/000007.bin'
     calib_path = '../data_example/3d_detection/calib/000007.txt'
+
+    # 读取点云
     point_in_lidar = read_bin(bin_path)
+    # 读取图像
     color_image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+    # 读取标定文件，包括相机内参矩阵、相机修正矩阵、相机-雷达外参矩阵
     _, _, P2, _, R0, lidar2camera_matrix, _ = read_calib(calib_path)
+    # print(P2, R0, lidar2camera_matrix, sep='\n')
     intrinsic = P2                      # 内参
     extrinsic = np.matmul(R0, lidar2camera_matrix)  # 雷达到相机外参
+    # 读取图像高、宽
     h, w = color_image.shape[:2]  # 图像高和宽
 
     point_in_image, mask = get_fov_mask(point_in_lidar, extrinsic, intrinsic, h, w)
@@ -266,8 +308,13 @@ if __name__ == '__main__':
                          point_in_image[:, 0].astype(np.int32)]  # N x 3
     colored_point = np.hstack((valid_points, colors))  # N x 6
 
+    '''
     # 获取深度图
+    '''
+    # 生成全0图，用于定义变量
     sparse_depth_image = np.zeros(shape=(h, w), dtype='float32')
+
+
     sparse_depth_image[point_in_image[:, 1].astype(np.int32),
                        point_in_image[:, 0].astype(np.int32)] = point_in_image[:, 2]
     colored_sparse_depth_image = get_colored_depth(sparse_depth_image)
