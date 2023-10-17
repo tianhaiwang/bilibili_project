@@ -76,6 +76,7 @@ def vis_pointcloud(points, colors=None):
     else:
         colors = (1, 1, 1, 1)
     og_widget = gl.GLViewWidget()
+    
     # 每个点的大小设为0.1
     point_size = np.zeros(points.shape[0], dtype=np.float16) + 0.1
 
@@ -84,6 +85,8 @@ def vis_pointcloud(points, colors=None):
 
     # 作为对比
     points_item2 = gl.GLScatterPlotItem(pos=points, size=point_size, color=(1, 1, 1, 1), pxMode=False)
+
+    # 原始点云z轴向上平移20，作为着色点云的对比
     points_item2.translate(0, 0, 20)
     og_widget.addItem(points_item2)
 
@@ -245,8 +248,13 @@ def depth_colorize(depth):
     cv2.imshow('test', colored)
     cv2.waitKey()
     """
+    # 确定是否是2维
     assert depth.ndim == 2, 'depth image shape need to be `H x W`.'
+
+    # 归一化为0-1
     depth = (depth - np.min(depth)) / (np.max(depth) - np.min(depth))
+
+    # 彩图生成
     depth = 255 * cmap(depth)[:, :, :3]  # H, W, C
     return depth
 
@@ -259,6 +267,8 @@ def get_colored_depth(depth):
     """
     if len(depth.shape) == 3:
         depth = depth.squeeze()
+
+    # 深度图渲染为二维RGB可视化效果
     colored_depth = depth_colorize(depth).astype(np.uint8)
     colored_depth = cv2.cvtColor(colored_depth, cv2.COLOR_RGB2BGR)
     return colored_depth
@@ -272,12 +282,21 @@ def render_image_with_depth(color_image, depth_image, max_depth=None):
     :param max_depth:  int 控制渲染效果
     :return:
     """
+    # 不复制会报错
     depth_image = depth_image.copy()
+
     if max_depth is not None:
         depth_image = np.minimum(depth_image, max_depth)
+    
+    # 不复制会报错
     color_image = color_image.copy()
+
     colored_depth = get_colored_depth(depth_image)
+
+    # 找出有效深度值(非0)的像素索引
     idx = depth_image != 0
+
+    # 根据索引，将有效深度值替换到原始RGB图像
     color_image[idx] = colored_depth[idx]
     return color_image
 
@@ -300,12 +319,18 @@ if __name__ == '__main__':
     # 读取图像高、宽
     h, w = color_image.shape[:2]  # 图像高和宽
 
+    # point_in_image是图像系(u,v,z)下的点云
+    # mask是视场掩膜
     point_in_image, mask = get_fov_mask(point_in_lidar, extrinsic, intrinsic, h, w)
+
+    # 获取在图像视野的雷达系(N,3)下有效点云
     valid_points = point_in_lidar[mask]
 
-    # 获取颜色
+    # 获取给点云着色的颜色信息，colors (N,3),3指R G B
     colors = color_image[point_in_image[:, 1].astype(np.int32),
                          point_in_image[:, 0].astype(np.int32)]  # N x 3
+    
+    # 拼接生成着色点云(N,6),6指 x y z R G B
     colored_point = np.hstack((valid_points, colors))  # N x 6
 
     '''
@@ -314,14 +339,23 @@ if __name__ == '__main__':
     # 生成全0图，用于定义变量
     sparse_depth_image = np.zeros(shape=(h, w), dtype='float32')
 
-
+    # 先v后u，全部设为整数类型，将z轴的深度信息赋值过来，生成深度图
     sparse_depth_image[point_in_image[:, 1].astype(np.int32),
                        point_in_image[:, 0].astype(np.int32)] = point_in_image[:, 2]
+    
+    # 深度图渲染为二维RGB可视化效果
     colored_sparse_depth_image = get_colored_depth(sparse_depth_image)
+
+    # 将深度图叠加到原始RGB图像，即点云投影到图像的最终可视化效果
     rendered_color_image = render_image_with_depth(color_image, sparse_depth_image)
 
+    '''
+    # 可视化
+    '''
+    # 点云投影到图像的渲染
     cv2.imshow('colored_sparse_depth', colored_sparse_depth_image)
     cv2.imshow('rendered_color_image', rendered_color_image.astype(np.uint8))
+    # 图像投影到点云的渲染
     vis_pointcloud(points=valid_points, colors=colors)
 
     # 保存numpy数组, 用作ros点云发布数据
